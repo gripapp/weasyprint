@@ -65,7 +65,9 @@ class WeasyPrint
       pdf.close_write
       pdf.gets(nil)
     end
-    result = File.read(path) if path
+    # binread, not read: the file is a PDF, and reading it under a non-binary external encoding
+    # makes the strip below raise Encoding::CompatibilityError on the binary bytes.
+    result = File.binread(path) if path
 
     # $? is thread safe per http://stackoverflow.com/questions/2164887/thread-safe-external-process-in-ruby-plus-checking-exitstatus
     raise "command failed (exitstatus=#{$?.exitstatus}): #{invoke}" if result.to_s.strip.empty? or !successful?($?)
