@@ -6,6 +6,7 @@ class WeasyPrint
       @app        = app
       @options    = options
       @conditions = conditions
+      @render_pdf = false
     end
 
     def call(env)
@@ -16,31 +17,81 @@ class WeasyPrint
       set_request_to_render_as_pdf(env) if render_as_pdf?
       status, headers, response = @app.call(env)
 
-      if rendering_pdf? && headers['Content-Type'] =~ /text\/html|application\/xhtml\+xml/
-        body = response.respond_to?(:body) ? response.body : response.join
-        body = body.join if body.is_a?(Array)
-        body = WeasyPrint.new(translate_paths(body, env), @options).to_pdf
+      if rendering_pdf? && header(headers, 'Content-Type') =~ /text\/html|application\/xhtml\+xml/
+        html = buffer_body(response)
+
+        # Rack 3 streaming bodies (those responding to #call rather than #each) cannot be
+        # buffered, so there is nothing to convert - pass them through untouched.
+        return [status, headers, response] if html.nil?
+
+        body = WeasyPrint.new(translate_paths(html, env), @options).to_pdf
+
+        # The upstream body has been consumed and is about to be discarded; Rack requires it be
+        # closed so whatever it holds open (file handles, DB connections) is released.
+        response.close if response.respond_to?(:close)
         response = [body]
 
-        if headers['WeasyPrint-save-pdf']
-          File.open(headers['WeasyPrint-save-pdf'], 'wb') { |file| file.write(body) } rescue nil
-          headers.delete('WeasyPrint-save-pdf')
+        if (save_path = header(headers, 'WeasyPrint-save-pdf'))
+          File.open(save_path, 'wb') { |file| file.write(body) } rescue nil
+          delete_header(headers, 'WeasyPrint-save-pdf')
         end
 
         unless @caching
           # Do not cache PDFs
-          headers.delete('ETag')
-          headers.delete('Cache-Control')
+          delete_header(headers, 'ETag')
+          delete_header(headers, 'Cache-Control')
         end
 
-        headers['Content-Length']         = (body.respond_to?(:bytesize) ? body.bytesize : body.size).to_s
-        headers['Content-Type']           = 'application/pdf'
+        set_header(headers, 'Content-Length', body.bytesize.to_s)
+        set_header(headers, 'Content-Type', 'application/pdf')
       end
 
       [status, headers, response]
     end
 
     private
+
+    # Rack 3 forbids uppercase characters in response header names, while Rack 2 and earlier
+    # conventionally capitalize them. Read and delete case-insensitively so this middleware works
+    # under both, and write using whichever casing the response is already using.
+
+    def header(headers, name)
+      headers[name] || headers[name.downcase] || begin
+        _, value = headers.find { |key, _| key.casecmp(name).zero? }
+        value
+      end
+    end
+
+    def delete_header(headers, name)
+      headers.delete(name)
+      headers.delete(name.downcase)
+      matching = headers.keys.select { |key| key.casecmp(name).zero? }
+      matching.each { |key| headers.delete(key) }
+    end
+
+    def set_header(headers, name, value)
+      existing = headers.keys.find { |key| key.casecmp(name).zero? }
+      headers[existing || (rack3? ? name.downcase : name)] = value
+    end
+
+    def rack3?
+      @rack3 = Gem::Version.new(Rack.release.to_s) >= Gem::Version.new('3.0') unless defined?(@rack3)
+      @rack3
+    end
+
+    # Collect the upstream response body into a String. Returns nil when the body cannot be
+    # buffered, which under Rack 3 means a streaming body that only responds to #call.
+    def buffer_body(response)
+      if response.respond_to?(:to_ary)
+        response.to_ary.join
+      elsif response.respond_to?(:each)
+        buffered = +''
+        response.each { |part| buffered << part }
+        buffered
+      elsif response.respond_to?(:body)
+        Array(response.body).join
+      end
+    end
 
     # Change relative paths to absolute
     def translate_paths(body, env)
