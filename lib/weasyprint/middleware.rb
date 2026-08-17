@@ -12,23 +12,33 @@ class WeasyPrint
     def call(env)
       @request    = Rack::Request.new(env)
       @render_pdf = false
-      @caching    = @conditions.delete(:caching) { false }
+      # fetch, not delete: @conditions is the same Hash for every request this (long-lived,
+      # shared-across-threads) middleware instance handles. delete permanently removed :caching
+      # after the first request ever served, so caching: true silently stopped working from the
+      # second request onward.
+      @caching    = @conditions.fetch(:caching, false)
 
       set_request_to_render_as_pdf(env) if render_as_pdf?
       status, headers, response = @app.call(env)
 
-      if rendering_pdf? && header(headers, 'Content-Type') =~ /text\/html|application\/xhtml\+xml/
+      content_type = header(headers, 'Content-Type')
+      content_type = content_type.first if content_type.is_a?(Array)
+
+      if rendering_pdf? && content_type.to_s =~ /text\/html|application\/xhtml\+xml/
         html = buffer_body(response)
 
         # Rack 3 streaming bodies (those responding to #call rather than #each) cannot be
         # buffered, so there is nothing to convert - pass them through untouched.
         return [status, headers, response] if html.nil?
 
-        body = WeasyPrint.new(translate_paths(html, env), @options).to_pdf
-
-        # The upstream body has been consumed and is about to be discarded; Rack requires it be
-        # closed so whatever it holds open (file handles, DB connections) is released.
-        response.close if response.respond_to?(:close)
+        begin
+          body = WeasyPrint.new(translate_paths(html, env), @options).to_pdf
+        ensure
+          # The upstream body has been consumed and is being discarded; Rack requires it be
+          # closed so whatever it holds open (file handles, DB connections) is released. This
+          # must run even if to_pdf raises, or the body leaks on every failed conversion.
+          response.close if response.respond_to?(:close)
+        end
         response = [body]
 
         if (save_path = header(headers, 'WeasyPrint-save-pdf'))
@@ -70,8 +80,16 @@ class WeasyPrint
     end
 
     def set_header(headers, name, value)
-      existing = headers.keys.find { |key| key.casecmp(name).zero? }
-      headers[existing || (rack3? ? name.downcase : name)] = value
+      correct_name = rack3? ? name.downcase : name
+
+      # An existing key found only by case-insensitive match may be cased wrong for the running
+      # Rack version (e.g. an upstream that emits "Content-Type" while running on Rack 3, which
+      # forbids uppercase header names). Reusing that casing would just perpetuate the violation,
+      # so drop it and write the correct one instead.
+      matching = headers.keys.select { |key| key.casecmp(name).zero? && key != correct_name }
+      matching.each { |key| headers.delete(key) }
+
+      headers[correct_name] = value
     end
 
     def rack3?
@@ -81,6 +99,13 @@ class WeasyPrint
 
     # Collect the upstream response body into a String. Returns nil when the body cannot be
     # buffered, which under Rack 3 means a streaming body that only responds to #call.
+    #
+    # The Rack 3 SPEC says middleware "must not call each directly" on an Enumerable Body - it
+    # should instead return a new body that consumes the original lazily during its own #each.
+    # That isn't possible here: converting HTML to PDF fundamentally requires the complete
+    # content before this method can return, to compute the PDF and its final Content-Length.
+    # Eager buffering is the deliberate, unavoidable consequence of what this middleware does,
+    # not an oversight.
     def buffer_body(response)
       if response.respond_to?(:to_ary)
         response.to_ary.join
@@ -89,7 +114,13 @@ class WeasyPrint
         response.each { |part| buffered << part }
         buffered
       elsif response.respond_to?(:body)
-        Array(response.body).join
+        # Rails' ActionDispatch::Response::RackBody always exposes #body, even when the
+        # underlying stream is call-only (e.g. ActionController::Live). In that case
+        # Response#body falls back to returning the raw stream object itself, which is not
+        # string-like - only use the result if it actually is, or a call-only body here would
+        # silently render as a PDF of that object's #to_s.
+        content = response.body
+        content.to_str if content.respond_to?(:to_str)
       end
     end
 

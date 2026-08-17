@@ -43,6 +43,34 @@ class StreamingBody
   end
 end
 
+# Simulates Rails' ActionDispatch::Response::RackBody wrapping a call-only stream (e.g. an
+# ActionController::Live response). It exposes #body like any RackBody, but the value #body
+# returns is not string-like - Response#body's own to_ary/body fallback bottoms out at
+# returning the raw stream object when the stream implements neither.
+class UnbufferableBody
+  def body
+    Object.new
+  end
+end
+
+# An enumerable body that raises partway through conversion, to exercise the exception path:
+# the original body must still be closed even when PDF generation fails after it's consumed.
+class RaisingBody
+  attr_reader :closed
+
+  def initialize
+    @closed = false
+  end
+
+  def each
+    yield 'Hello world!'
+  end
+
+  def close
+    @closed = true
+  end
+end
+
 describe WeasyPrint::Middleware do
   let(:headers) { {header_name('Content-Type') => "text/html"} }
 
@@ -449,6 +477,34 @@ describe WeasyPrint::Middleware do
         expect(last_response.headers[header_name('Content-Type')]).to eq('application/pdf')
         expect(last_response.headers[header_name('Content-Length')]).to eq(last_response.body.bytesize.to_s)
       end
+
+      it "normalizes an existing header to the correct casing rather than keeping the upstream's" do
+        skip "Rack 3 only - Rack 2 does not enforce header casing" unless RACK3
+
+        other_casing = 'Content-Type'
+        builder = Rack::Builder.new
+        builder.use Rack::Lint
+        builder.use WeasyPrint::Middleware
+        builder.run lambda { |env| [200, { other_casing => 'text/html' }, ['Hello world!']] }
+        @app = builder.to_app
+
+        # Must not raise: if set_header kept the upstream's uppercase key instead of normalizing
+        # it, Rack::Lint would reject the response with "uppercase character in header name".
+        expect {
+          @app.call(Rack::MockRequest.env_for('http://www.example.org/public/test.pdf'))
+        }.not_to raise_error
+      end
+
+      it "does not crash when a header value is a Rack-valid Array rather than a String" do
+        builder = Rack::Builder.new
+        builder.use WeasyPrint::Middleware
+        builder.run lambda { |env| [200, { header_name('Content-Type') => ['text/html'] }, ['Hello world!']] }
+        @app = builder.to_app
+
+        expect {
+          @app.call(Rack::MockRequest.env_for('http://www.example.org/public/test.pdf'))
+        }.not_to raise_error
+      end
     end
 
     describe "response bodies" do
@@ -483,6 +539,45 @@ describe WeasyPrint::Middleware do
 
         expect(status).to eq(200)
         expect(returned).to be(body)
+      end
+
+      it "passes through a call-only body wrapped the way Rails' RackBody wraps one, instead of stringifying it" do
+        body = UnbufferableBody.new
+        mock_app({}, {}, {}, body)
+
+        status, _headers, returned = @app.call(Rack::MockRequest.env_for('http://www.example.org/public/test.pdf'))
+
+        expect(status).to eq(200)
+        expect(returned).to be(body)
+      end
+
+      it "closes the upstream body even when PDF generation raises" do
+        body = RaisingBody.new
+        mock_app({}, {}, {}, body)
+        allow_any_instance_of(WeasyPrint).to receive(:to_pdf).and_raise(RuntimeError, "boom")
+
+        expect {
+          get 'http://www.example.org/public/test.pdf'
+        }.to raise_error(RuntimeError, "boom")
+
+        expect(body.closed).to be(true)
+      end
+    end
+
+    describe "caching option" do
+      # @conditions is the same Hash across every request a middleware instance handles (Rails
+      # builds the middleware once and reuses it), so this must not survive by accident only
+      # because each example builds a fresh instance via mock_app.
+      let(:headers) { {header_name('Content-Type') => "text/html", header_name('ETag') => 'foo'} }
+
+      it "applies caching: true on every request, not just the first" do
+        mock_app({}, { caching: true, only: '/public' })
+
+        get 'http://www.example.org/public/test.pdf'
+        expect(last_response.headers[header_name('ETag')]).not_to be_nil
+
+        get 'http://www.example.org/public/test.pdf'
+        expect(last_response.headers[header_name('ETag')]).not_to be_nil
       end
     end
   end
