@@ -22,3 +22,9 @@ pkg
 .bundle
 spec/custom_weasyprint_path.rb
 spec/test_save.pdf
+
+## Matrix gemfile lockfiles - resolved per Rack version, not pinned
+gemfiles/*.lock
+
+## JetBrains
+.idea/

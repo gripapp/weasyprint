@@ -1,0 +1,11 @@
+# Rack 2 half of the compatibility matrix. The middleware has to keep working under both Rack 2
+# and Rack 3, which differ on response header casing, so run the suite against each:
+#
+#   BUNDLE_GEMFILE=gemfiles/rack2.gemfile bundle exec rspec
+#   BUNDLE_GEMFILE=gemfiles/rack3.gemfile bundle exec rspec
+source 'https://rubygems.org'
+
+gem 'rack', '~> 2.2'
+gem 'rack-test', '~> 2.0'
+
+gemspec path: '..'
