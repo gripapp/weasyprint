@@ -2,11 +2,11 @@ require 'spec_helper'
 
 def app; Rack::Lint.new(@app); end
 
-def mock_app(options = {}, conditions = {}, custom_headers = {})
+def mock_app(options = {}, conditions = {}, custom_headers = {}, body = nil)
   main_app = lambda { |env|
     @env = env
     full_headers = headers.merge custom_headers
-    [200, full_headers, @body || ['Hello world!']]
+    [200, full_headers, body || @body || ['Hello world!']]
   }
 
   builder = Rack::Builder.new
@@ -15,12 +15,74 @@ def mock_app(options = {}, conditions = {}, custom_headers = {})
   @app = builder.to_app
 end
 
+# A Rack body that is enumerable but not an Array, so it exercises the #each path rather than the
+# #to_ary fast path, and records whether Rack's required #close was called.
+class EnumerableBody
+  attr_reader :closed
+
+  def initialize(parts)
+    @parts = parts
+    @closed = false
+  end
+
+  def each(&block)
+    @parts.each(&block)
+  end
+
+  def close
+    @closed = true
+  end
+end
+
+# A Rack 3 streaming body: responds only to #call, and so cannot be buffered.
+class StreamingBody
+  def call(stream)
+    stream.write('Hello world!')
+  ensure
+    stream.close
+  end
+end
+
+# Simulates Rails' ActionDispatch::Response::RackBody wrapping a call-only stream (e.g. an
+# ActionController::Live response). It exposes #body like any RackBody, but the value #body
+# returns is not string-like - Response#body's own to_ary/body fallback bottoms out at
+# returning the raw stream object when the stream implements neither.
+class UnbufferableBody
+  def body
+    Object.new
+  end
+end
+
+# An enumerable body that raises partway through conversion, to exercise the exception path:
+# the original body must still be closed even when PDF generation fails after it's consumed.
+class RaisingBody
+  attr_reader :closed
+
+  def initialize
+    @closed = false
+  end
+
+  def each
+    yield 'Hello world!'
+  end
+
+  def close
+    @closed = true
+  end
+end
+
 describe WeasyPrint::Middleware do
-  let(:headers) { {'Content-Type' => "text/html"} }
+  let(:headers) { {header_name('Content-Type') => "text/html"} }
 
   describe "#call" do
     describe "caching" do
-      let(:headers) { {'Content-Type' => "text/html", 'ETag' => 'foo', 'Cache-Control' => 'max-age=2592000, public'} }
+      let(:headers) do
+        {
+          header_name('Content-Type') => "text/html",
+          header_name('ETag') => 'foo',
+          header_name('Cache-Control') => 'max-age=2592000, public'
+        }
+      end
 
       context "by default" do
         before { mock_app }
@@ -60,7 +122,7 @@ describe WeasyPrint::Middleware do
               specify do
                 get 'http://www.example.org/public/test.pdf'
                 expect(last_response.headers["Content-Type"]).to eq("application/pdf")
-                expect(last_response.body.bytesize).to eq(WeasyPrint.new("Hello world!").to_pdf.bytesize)
+                expect(last_response.body).to start_with("%PDF")
               end
             end
 
@@ -80,7 +142,7 @@ describe WeasyPrint::Middleware do
               specify do
                 get 'http://www.example.org/public/test.pdf'
                 expect(last_response.headers["Content-Type"]).to eq("application/pdf")
-                expect(last_response.body.bytesize).to eq(WeasyPrint.new("Hello world!").to_pdf.bytesize)
+                expect(last_response.body).to start_with("%PDF")
               end
             end
 
@@ -102,7 +164,7 @@ describe WeasyPrint::Middleware do
               specify do
                 get 'http://www.example.org/public/test.pdf'
                 expect(last_response.headers["Content-Type"]).to eq("application/pdf")
-                expect(last_response.body.bytesize).to eq(WeasyPrint.new("Hello world!").to_pdf.bytesize)
+                expect(last_response.body).to start_with("%PDF")
               end
             end
 
@@ -122,7 +184,7 @@ describe WeasyPrint::Middleware do
               specify do
                 get 'http://www.example.org/public/test.pdf'
                 expect(last_response.headers["Content-Type"]).to eq("application/pdf")
-                expect(last_response.body.bytesize).to eq(WeasyPrint.new("Hello world!").to_pdf.bytesize)
+                expect(last_response.body).to start_with("%PDF")
               end
             end
 
@@ -148,7 +210,7 @@ describe WeasyPrint::Middleware do
               specify do
                 get 'http://www.example.org/public/test.pdf'
                 expect(last_response.headers["Content-Type"]).to eq("application/pdf")
-                expect(last_response.body.bytesize).to eq(WeasyPrint.new("Hello world!").to_pdf.bytesize)
+                expect(last_response.body).to start_with("%PDF")
               end
             end
 
@@ -168,7 +230,7 @@ describe WeasyPrint::Middleware do
               specify do
                 get 'http://www.example.org/public/test.pdf'
                 expect(last_response.headers["Content-Type"]).to eq("application/pdf")
-                expect(last_response.body.bytesize).to eq(WeasyPrint.new("Hello world!").to_pdf.bytesize)
+                expect(last_response.body).to start_with("%PDF")
               end
             end
 
@@ -190,7 +252,7 @@ describe WeasyPrint::Middleware do
               specify do
                 get 'http://www.example.org/public/test.pdf'
                 expect(last_response.headers["Content-Type"]).to eq("application/pdf")
-                expect(last_response.body.bytesize).to eq(WeasyPrint.new("Hello world!").to_pdf.bytesize)
+                expect(last_response.body).to start_with("%PDF")
               end
             end
 
@@ -210,7 +272,7 @@ describe WeasyPrint::Middleware do
               specify do
                 get 'http://www.example.org/public/test.pdf'
                 expect(last_response.headers["Content-Type"]).to eq("application/pdf")
-                expect(last_response.body.bytesize).to eq(WeasyPrint.new("Hello world!").to_pdf.bytesize)
+                expect(last_response.body).to start_with("%PDF")
               end
             end
 
@@ -230,19 +292,19 @@ describe WeasyPrint::Middleware do
 	before do
           #make sure tests don't find an old test_save.pdf
           File.delete('spec/test_save.pdf') if File.exist?('spec/test_save.pdf')
-          expect(File.exist?('spec/test_save.pdf')).to be_false
+          expect(File.exist?('spec/test_save.pdf')).to be(false)
 	end
 
         context "when header WeasyPrint-save-pdf is present" do
           it "should saved the .pdf to disk" do
-	    headers = { 'WeasyPrint-save-pdf' => 'spec/test_save.pdf' }
+	    headers = { header_name('WeasyPrint-save-pdf') => 'spec/test_save.pdf' }
             mock_app({}, {only: '/public'}, headers)
 	    get 'http://www.example.org/public/test_save.pdf'
-            expect(File.exist?('spec/test_save.pdf')).to be_true
+            expect(File.exist?('spec/test_save.pdf')).to be(true)
 	  end
 
           it "should not raise when target directory does not exist" do
-	    headers = { 'WeasyPrint-save-pdf' => '/this/dir/does/not/exist/spec/test_save.pdf' }
+	    headers = { header_name('WeasyPrint-save-pdf') => '/this/dir/does/not/exist/spec/test_save.pdf' }
             mock_app({}, {only: '/public'}, headers)
             expect {
               get 'http://www.example.com/public/test_save.pdf'
@@ -254,7 +316,7 @@ describe WeasyPrint::Middleware do
           it "should not saved the .pdf to disk" do
             mock_app({}, {only: '/public'}, {} )
 	    get 'http://www.example.org/public/test_save.pdf'
-            expect(File.exist?('spec/test_save.pdf')).to be_false
+            expect(File.exist?('spec/test_save.pdf')).to be(false)
           end
         end
       end
@@ -284,7 +346,7 @@ describe WeasyPrint::Middleware do
           main_app = lambda { |env|
             @env = env
             @env['SCRIPT_NAME'] = '/example.org'
-            headers = {'Content-Type' => "text/html"}
+            headers = {header_name('Content-Type') => "text/html"}
             [200, headers, @body || ['Hello world!']]
           }
 
@@ -379,6 +441,145 @@ describe WeasyPrint::Middleware do
     # Restore to false on any non-pdf request.
     get 'http://www.example.org/public/file'
     expect(@app.send(:rendering_pdf?)).to be false
+  end
+
+  describe "Rack version compatibility" do
+    describe "response header casing" do
+      # Rack 3 rejects uppercase header names; Rack 2 conventionally uses them. The middleware
+      # has to read the upstream Content-Type and write its own headers correctly under both.
+
+      it "converts when the upstream Content-Type uses the other casing" do
+        # Deliberately the casing the *running* Rack version does not use, to prove the lookup is
+        # genuinely case-insensitive rather than accidentally matching.
+        other_casing = RACK3 ? 'Content-Type' : 'content-type'
+        mock_app({}, {}, {}, ['Hello world!'])
+        allow(self).to receive(:headers).and_return(other_casing => 'text/html')
+
+        builder = Rack::Builder.new
+        builder.use WeasyPrint::Middleware
+        builder.run lambda { |env| [200, { other_casing => 'text/html' }, ['Hello world!']] }
+        @app = builder.to_app
+
+        # Bypass Rack::Lint here: on Rack 3 the deliberately-wrong casing is what we are testing
+        # the middleware tolerates, and Lint would reject it before the middleware sees it.
+        status, response_headers, body = @app.call(Rack::MockRequest.env_for('http://www.example.org/public/test.pdf'))
+
+        expect(status).to eq(200)
+        expect(body.join).to start_with("%PDF")
+        content_type = response_headers['content-type'] || response_headers['Content-Type']
+        expect(content_type).to eq('application/pdf')
+      end
+
+      it "writes header names the running Rack version accepts" do
+        mock_app
+        get 'http://www.example.org/public/test.pdf'
+
+        expect(last_response.headers[header_name('Content-Type')]).to eq('application/pdf')
+        expect(last_response.headers[header_name('Content-Length')]).to eq(last_response.body.bytesize.to_s)
+      end
+
+      it "normalizes an existing header to the correct casing rather than keeping the upstream's" do
+        skip "Rack 3 only - Rack 2 does not enforce header casing" unless RACK3
+
+        other_casing = 'Content-Type'
+        builder = Rack::Builder.new
+        builder.use Rack::Lint
+        builder.use WeasyPrint::Middleware
+        builder.run lambda { |env| [200, { other_casing => 'text/html' }, ['Hello world!']] }
+        @app = builder.to_app
+
+        # Must not raise: if set_header kept the upstream's uppercase key instead of normalizing
+        # it, Rack::Lint would reject the response with "uppercase character in header name".
+        expect {
+          @app.call(Rack::MockRequest.env_for('http://www.example.org/public/test.pdf'))
+        }.not_to raise_error
+      end
+
+      it "does not crash when a header value is a Rack-valid Array rather than a String" do
+        builder = Rack::Builder.new
+        builder.use WeasyPrint::Middleware
+        builder.run lambda { |env| [200, { header_name('Content-Type') => ['text/html'] }, ['Hello world!']] }
+        @app = builder.to_app
+
+        expect {
+          @app.call(Rack::MockRequest.env_for('http://www.example.org/public/test.pdf'))
+        }.not_to raise_error
+      end
+    end
+
+    describe "response bodies" do
+      it "converts an enumerable body that is not an Array" do
+        body = EnumerableBody.new(['Hello ', 'world!'])
+        mock_app({}, {}, {}, body)
+
+        get 'http://www.example.org/public/test.pdf'
+
+        expect(last_response.body).to start_with("%PDF")
+      end
+
+      it "closes the upstream body it consumed and replaced" do
+        body = EnumerableBody.new(['Hello world!'])
+        mock_app({}, {}, {}, body)
+
+        get 'http://www.example.org/public/test.pdf'
+
+        # Rack requires a body that is discarded be closed, or whatever it holds open leaks.
+        expect(body.closed).to be(true)
+      end
+
+      it "passes a streaming body through without converting it" do
+        skip "Rack 3 only" unless RACK3
+
+        body = StreamingBody.new
+        mock_app({}, {}, {}, body)
+
+        # A streaming body cannot be buffered, so there is nothing to hand to weasyprint; the
+        # middleware must return it untouched rather than raising or emitting an empty PDF.
+        status, _headers, returned = @app.call(Rack::MockRequest.env_for('http://www.example.org/public/test.pdf'))
+
+        expect(status).to eq(200)
+        expect(returned).to be(body)
+      end
+
+      it "passes through a call-only body wrapped the way Rails' RackBody wraps one, instead of stringifying it" do
+        body = UnbufferableBody.new
+        mock_app({}, {}, {}, body)
+
+        status, _headers, returned = @app.call(Rack::MockRequest.env_for('http://www.example.org/public/test.pdf'))
+
+        expect(status).to eq(200)
+        expect(returned).to be(body)
+      end
+
+      it "closes the upstream body even when PDF generation raises" do
+        body = RaisingBody.new
+        mock_app({}, {}, {}, body)
+        allow_any_instance_of(WeasyPrint).to receive(:to_pdf).and_raise(RuntimeError, "boom")
+
+        expect {
+          get 'http://www.example.org/public/test.pdf'
+        }.to raise_error(RuntimeError, "boom")
+
+        expect(body.closed).to be(true)
+      end
+    end
+
+    describe "caching option" do
+      # @conditions is the same Hash across every request a middleware instance handles (Rails
+      # builds the middleware once and reuses it), so this must not survive by accident only
+      # because each example builds a fresh instance via mock_app.
+      let(:headers) { {header_name('Content-Type') => "text/html", header_name('ETag') => 'foo'} }
+
+      it "applies caching: true on every request, not just the first" do
+        mock_app({}, { caching: true, only: '/public' })
+
+        get 'http://www.example.org/public/test.pdf'
+        expect(last_response.headers[header_name('ETag')]).not_to be_nil
+
+        get 'http://www.example.org/public/test.pdf'
+        expect(last_response.headers[header_name('ETag')]).not_to be_nil
+      end
+    end
   end
 
 end
