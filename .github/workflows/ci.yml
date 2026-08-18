@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Workflow level, not job level: a job-level group would put both matrix legs in the same
+# group, where cancel-in-progress makes them cancel each other instead of superseded runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  spec:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    # The specs shell out to the weasyprint CLI and two of them fetch remote URLs, with no
+    # timeout around IO.popen. Fail in minutes rather than burning the 6h default.
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Installs the committed lockfile verbatim, so a Dependabot bump is tested as the
+          # exact version set it proposes. Also the Rack 3 half of the compatibility matrix.
+          - name: Rack 3 (root lockfile)
+            gemfile: Gemfile
+            frozen: 'true'
+          # gemfiles/*.lock is gitignored and resolves fresh, so there is nothing to freeze.
+          - name: Rack 2
+            gemfile: gemfiles/rack2.gemfile
+            frozen: 'false'
+    env:
+      # Job level, not step level: setup-ruby's bundler-cache runs bundle install itself and
+      # has to see the same gemfile the specs will run under.
+      BUNDLE_GEMFILE: ${{ github.workspace }}/${{ matrix.gemfile }}
+      BUNDLE_FROZEN: ${{ matrix.frozen }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install WeasyPrint
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y weasyprint
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+
+      - run: bundle exec rspec
