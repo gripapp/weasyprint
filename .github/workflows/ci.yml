@@ -8,48 +8,59 @@ on:
 permissions:
   contents: read
 
-# Workflow level, not job level: a job-level group would put both matrix legs in the same
-# group, where cancel-in-progress makes them cancel each other instead of superseded runs.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   spec:
-    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
-    # The specs shell out to the weasyprint CLI and two of them fetch remote URLs, with no
-    # timeout around IO.popen. Fail in minutes rather than burning the 6h default.
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Installs the committed lockfile verbatim, so a Dependabot bump is tested as the
-          # exact version set it proposes. Also the Rack 3 half of the compatibility matrix.
-          - name: Rack 3 (root lockfile)
-            gemfile: Gemfile
-            frozen: 'true'
-          # gemfiles/*.lock is gitignored and resolves fresh, so there is nothing to freeze.
-          - name: Rack 2
-            gemfile: gemfiles/rack2.gemfile
-            frozen: 'false'
-    env:
-      # Job level, not step level: setup-ruby's bundler-cache runs bundle install itself and
-      # has to see the same gemfile the specs will run under.
-      BUNDLE_GEMFILE: ${{ github.workspace }}/${{ matrix.gemfile }}
-      BUNDLE_FROZEN: ${{ matrix.frozen }}
     steps:
       - uses: actions/checkout@v7
 
+      # Installing weasyprint is identical for both Rack versions, so it happens once here
+      # rather than once per matrix leg. apt on these runners has stalled on a mirror before
+      # (14 minutes with no output), so each apt-get call is capped and retried instead of
+      # trusting the job timeout to be the only backstop.
       - name: Install WeasyPrint
+        timeout-minutes: 7
         run: |
-          sudo apt-get update
-          sudo apt-get install -y weasyprint
+          apt_retry() {
+            for attempt in 1 2 3; do
+              sudo timeout 45 apt-get -o Acquire::Retries=2 \
+                -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 "$@" && return 0
+              echo "::warning::apt-get $* stalled or failed (attempt $attempt/3), retrying"
+              sleep 10
+            done
+            return 1
+          }
+          apt_retry update
+          apt_retry install -y weasyprint
 
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.4'
-          bundler-cache: true
+          bundler-cache: false
 
-      - run: bundle exec rspec
+      # Installs the committed root lockfile verbatim, so a Dependabot bump is tested as the
+      # exact version set it proposes. Also the Rack 3 half of the compatibility matrix.
+      - name: Rack 3 (root lockfile)
+        env:
+          BUNDLE_GEMFILE: ${{ github.workspace }}/Gemfile
+          BUNDLE_FROZEN: 'true'
+        run: |
+          bundle install
+          bundle exec rspec
+
+      # gemfiles/rack2.gemfile.lock is gitignored and resolves fresh, so there is nothing to
+      # freeze. Runs even if the step above failed, so one Rack version failing doesn't hide
+      # the other's result.
+      - name: Rack 2
+        if: always()
+        env:
+          BUNDLE_GEMFILE: ${{ github.workspace }}/gemfiles/rack2.gemfile
+          BUNDLE_FROZEN: 'false'
+        run: |
+          bundle install
+          bundle exec rspec
