@@ -20,23 +20,31 @@ jobs:
       - uses: actions/checkout@v7
 
       # Installing weasyprint is identical for both Rack versions, so it happens once here
-      # rather than once per matrix leg. apt on these runners has stalled on a mirror before
-      # (14 minutes with no output), so each apt-get call is capped and retried instead of
-      # trusting the job timeout to be the only backstop.
+      # rather than once per matrix leg.
+      #
+      # apt-get update only refreshes index files, so it's safe to hard-kill on a stall - that's
+      # exactly what happened once before (14 minutes of silence against a mirror). The retry
+      # loop below targets that.
+      #
+      # apt-get install unpacks and configures ~40MB of packages (weasyprint pulls in
+      # numpy/scipy/sympy transitively), which legitimately takes a couple of minutes - killing
+      # it mid-unpack doesn't just fail cleanly, it corrupts dpkg's state ("dpkg was
+      # interrupted"), which then fails every subsequent retry regardless of the network. So
+      # that phase gets apt's own network-timeout/retry options instead of an external kill, plus
+      # a defensive `dpkg --configure -a` in case a previous attempt left things interrupted.
       - name: Install WeasyPrint
-        timeout-minutes: 7
+        timeout-minutes: 10
         run: |
-          apt_retry() {
-            for attempt in 1 2 3; do
-              sudo timeout 45 apt-get -o Acquire::Retries=2 \
-                -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 "$@" && return 0
-              echo "::warning::apt-get $* stalled or failed (attempt $attempt/3), retrying"
-              sleep 10
-            done
-            return 1
-          }
-          apt_retry update
-          apt_retry install -y weasyprint
+          apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+
+          for attempt in 1 2 3; do
+            sudo timeout 45 apt-get "${apt_opts[@]}" update && break
+            echo "::warning::apt-get update stalled or failed (attempt $attempt/3), retrying"
+            sleep 10
+          done
+
+          sudo dpkg --configure -a || true
+          sudo apt-get "${apt_opts[@]}" install -y weasyprint
 
       - uses: ruby/setup-ruby@v1
         with:
